@@ -109,8 +109,8 @@ void ConnPool::Conn::_send_data(const conn_t &conn, int fd, int events) {
 void ConnPool::Conn::_send_data_udp(const conn_t &conn, int fd, int events) {
     if (events & FdEvent::ERROR)
     {
-        SALTICIDAE_LOG_INFO("error in _send_data");
-        conn->cpool->worker_terminate(conn);
+        //SALTICIDAE_LOG_INFO("error in _send_data");
+        //conn->cpool->worker_terminate(conn);
         return;
     }
     ssize_t ret = conn->recv_chunk_size;
@@ -202,8 +202,8 @@ void ConnPool::Conn::_recv_data(const conn_t &conn, int fd, int events) {
 void ConnPool::Conn::_recv_data_udp(const conn_t &conn, int fd, int events) {
     if (events & FdEvent::ERROR)
     {
-        SALTICIDAE_LOG_INFO("error in _recv_data");
-        conn->cpool->worker_terminate(conn);
+        //SALTICIDAE_LOG_INFO("error in _recv_data");
+        //conn->cpool->worker_terminate(conn);
         return;
     }
     const size_t recv_chunk_size = conn->recv_chunk_size;

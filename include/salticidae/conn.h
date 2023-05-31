@@ -466,8 +466,8 @@ class ConnPool {
         Config():
             _max_listen_backlog(10),
             _conn_server_timeout(2),
-            _recv_chunk_size(4096),
-            _max_recv_buff_size(4096),
+            _recv_chunk_size(1<<15),
+            _max_recv_buff_size(1<<15),
             _max_send_buff_size(0),
             _nworker(1),
             _index(0),
