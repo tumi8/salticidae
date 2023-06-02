@@ -435,16 +435,12 @@ void ConnPool::conn_server(const conn_t &conn, int fd, int events) {
 
         int ret;
         socklen_t opt_len = (socklen_t) sizeof(struct sctp_status);
-        if (ret = ::getsockopt(fd,
-                               IPPROTO_SCTP,
-                               SCTP_STATUS,
-                               &sstate,
-                               &opt_len) < 0){
-            SALTICIDAE_LOG_DEBUG("Failed to acquire SCTP socket status: %s", strerror(errno));
-            throw SalticidaeError(SALTI_ERROR_CONNECT, errno);
-        }
 
-        if (sstate.sstat_state == SCTP_ESTABLISHED) {
+        // this operation returns -1, if the socket is not actually connected,
+        // yet. Hence this allows us to check the conn status
+        ret = ::getsockopt(fd, IPPROTO_SCTP, SCTP_STATUS, &sstate, &opt_len);
+
+        if (ret >= 0 && sstate.sstat_state == SCTP_ESTABLISHED) {
             conn->ev_connect.del();
             SALTICIDAE_LOG_DEBUG("connected to remote %s", std::string(*conn).c_str());
             auto &worker = select_worker();
@@ -515,7 +511,7 @@ void ConnPool::_listen(NetAddr listen_addr) {
 
     struct sockaddr_in sockin;
     memset(&sockin, 0, sizeof(struct sockaddr_in));
-    sockin.sin_family = AF_INET;
+    sockin.sin_family = PF_INET;
     sockin.sin_addr.s_addr = INADDR_ANY;
     sockin.sin_port = listen_addr.port;
 
@@ -577,7 +573,7 @@ ConnPool::conn_t ConnPool::_connect(const NetAddr &addr) {
     int fd;
     int one = 1;
 
-    if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)) < 0)
+    if ((fd = socket(PF_INET, SOCK_STREAM, IPPROTO_SCTP)) < 0)
         throw ConnPoolError(SALTI_ERROR_CONNECT, errno);
 
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one)) < 0)
@@ -599,7 +595,7 @@ ConnPool::conn_t ConnPool::_connect(const NetAddr &addr) {
 
     struct sockaddr_in sockin;
     memset(&sockin, 0, sizeof(struct sockaddr_in));
-    sockin.sin_family = AF_INET;
+    sockin.sin_family = PF_INET;
     sockin.sin_addr.s_addr = addr.ip;
     sockin.sin_port = addr.port;
 
