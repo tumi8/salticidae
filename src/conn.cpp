@@ -302,15 +302,15 @@ void ConnPool::disp_terminate(const conn_t &conn) {
 
 void ConnPool::configure_sctp_socket(int fd, SalticidaeErrorCode ec) {
     const int one = 1;
-    struct sctp_rtoinfo srtoi = { .srto_initial = 3000,  /* Configure RTO in ms*/
-                                  .srto_max     = 60000,
-                                  .srto_min     = 1000 };
+    struct sctp_rtoinfo srtoi = { .srto_initial = 50,  /* Configure RTO in ms*/
+                                  .srto_max     = 50,
+                                  .srto_min     = 50 };
     sctp_spp_flags flags = sctp_spp_flags (
 //                            SPP_HB_DISABLE   |        /* Disable Heartbeats */
 //                            SPP_PMTUD_ENABLE |        /* Enable PMTU detect */
                             SPP_SACKDELAY_ENABLE        /* Disable SACK delay */
                           );
-    struct sctp_paddrparams spparam = { .spp_sackdelay = 200,
+    struct sctp_paddrparams spparam = { .spp_sackdelay = 50,
                                         .spp_flags = flags };
 
     if (setsockopt(fd, SOL_SCTP, SCTP_RTOINFO, &srtoi, sizeof(srtoi)) < 0)
