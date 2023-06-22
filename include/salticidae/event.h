@@ -86,6 +86,7 @@ class FdEvent {
     using callback_t = std::function<void(int fd, int events)>;
     static const int READ = UV_READABLE;
     static const int WRITE = UV_WRITABLE;
+    static const int PRIO = UV_PRIORITIZED;
     static const int ERROR = 1 << 30;
 
     protected:

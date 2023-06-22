@@ -25,9 +25,10 @@
 #ifndef _SALTICIDAE_UTIL_H
 #define _SALTICIDAE_UTIL_H
 
-#include <getopt.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <getopt.h>
+#include <stdexcept>
+#include <unistd.h>
 #include "salticidae/config.h"
 
 typedef struct SalticidaeCError {

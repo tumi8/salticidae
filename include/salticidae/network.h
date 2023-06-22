@@ -35,6 +35,7 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <openssl/rand.h>
+
 namespace salticidae {
 /** Network of nodes who can send async messages.  */
 template<typename OpcodeType>
@@ -260,6 +261,10 @@ class MsgNetwork: public ConnPool {
     conn_t connect_sync(const NetAddr &addr) {
         return static_pointer_cast<Conn>(ConnPool::connect_sync(addr));
     }
+    conn_t connect_sync_tcp(const NetAddr &addr) {
+        return static_pointer_cast<Conn>(ConnPool::connect_sync_tcp(addr));
+    }
+
 };
 
 /** Simple network that handles client-server requests. */
@@ -782,9 +787,24 @@ void PeerNetwork<O, _, __>::on_dispatcher_setup(const ConnPool::conn_t &_conn) {
     if (conn->get_mode() == Conn::ConnMode::ACTIVE)
     {
         auto pid = get_peer_id(conn, conn->get_addr());
+
+        size_t first_qword = pid.cheap_hash();
+        SALTICIDAE_LOG_DEBUG("Peer ID of current connection: 0x%016llx... with address %s", first_qword, std::string(conn->get_addr()).c_str());
+
+        /*
+        int count = 0;
+        for (auto at = known_peers.begin(); at != known_peers.end(); at++) {
+            first_qword = (*at).first.cheap_hash();
+            SALTICIDAE_LOG_INFO("Peer ID of connection[%d]: 0x%016llx... with address %s", count, first_qword, std::string((*at).second->addr).c_str());
+            count++;
+        }
+        */
+
         auto it = known_peers.find(pid);
-        if (it == known_peers.end())
+        if (it == known_peers.end()){
+            SALTICIDAE_LOG_DEBUG("Couldn't find current peer ID in known peers");
             throw PeerNetworkError(SALTI_ERROR_PEER_NOT_MATCH);
+        }
         else
         {
             pinfo_slock_t _g(known_peers_lock);

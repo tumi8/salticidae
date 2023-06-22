@@ -22,13 +22,15 @@
  * SOFTWARE.
  */
 
-#include <cstring>
 #include <cassert>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/tcp.h>
+#include <cstring>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/sctp.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
+#include <string.h>
 
 #include "salticidae/util.h"
 #include "salticidae/conn.h"
@@ -298,7 +300,31 @@ void ConnPool::disp_terminate(const conn_t &conn) {
         });
 }
 
-void ConnPool::accept_client(int fd, int) {
+void ConnPool::configure_sctp_socket(int fd, SalticidaeErrorCode ec) {
+    const int one = 1;
+    struct sctp_rtoinfo srtoi = { .srto_initial = 3000,  /* Configure RTO in ms*/
+                                  .srto_max     = 60000,
+                                  .srto_min     = 1000 };
+    sctp_spp_flags flags = sctp_spp_flags (
+//                            SPP_HB_DISABLE   |        /* Disable Heartbeats */
+//                            SPP_PMTUD_ENABLE |        /* Enable PMTU detect */
+                            SPP_SACKDELAY_ENABLE        /* Disable SACK delay */
+                          );
+    struct sctp_paddrparams spparam = { .spp_sackdelay = 200,
+                                        .spp_flags = flags };
+
+    if (setsockopt(fd, SOL_SCTP, SCTP_RTOINFO, &srtoi, sizeof(srtoi)) < 0)
+        throw ConnPoolError(ec, errno);
+
+    if (setsockopt(fd, SOL_SCTP, SCTP_NODELAY, &one, sizeof(one)) < 0)
+        throw ConnPoolError(ec, errno);
+
+    if (setsockopt(fd, SOL_SCTP, SCTP_PEER_ADDR_PARAMS, &spparam, sizeof(spparam)) < 0)
+        throw ConnPoolError(ec, errno);
+}
+
+
+void ConnPool::accept_client_tcp(int fd, int) {
     int client_fd;
     struct sockaddr client_addr;
     try {
@@ -334,7 +360,44 @@ void ConnPool::accept_client(int fd, int) {
     } catch (...) { recoverable_error(std::current_exception(), -1); }
 }
 
-void ConnPool::conn_server(const conn_t &conn, int fd, int events) {
+void ConnPool::accept_client(int fd, int) {
+    int client_fd;
+    struct sockaddr client_addr;
+    try {
+        socklen_t addr_size = sizeof(struct sockaddr_in);
+        if ((client_fd = accept(fd, &client_addr, &addr_size)) < 0)
+        {
+            ev_listen.del();
+            throw ConnPoolError(SALTI_ERROR_ACCEPT, errno);
+        }
+        else
+        {
+            configure_sctp_socket(client_fd, SALTI_ERROR_ACCEPT);
+
+            if (fcntl(client_fd, F_SETFL, O_NONBLOCK) == -1)
+                throw ConnPoolError(SALTI_ERROR_ACCEPT, errno);
+
+            NetAddr addr((struct sockaddr_in *)&client_addr);
+            conn_t conn = create_conn();
+            conn->send_buffer.set_capacity(max_send_buff_size);
+            conn->recv_chunk_size = recv_chunk_size;
+            conn->max_recv_buff_size = max_recv_buff_size;
+            conn->fd = client_fd;
+            conn->cpool = this;
+            conn->mode = Conn::PASSIVE;
+            conn->addr = addr;
+            add_conn(conn);
+            SALTICIDAE_LOG_INFO("accepted %s", std::string(*conn).c_str());
+
+            auto &worker = select_worker();
+            conn->worker = &worker;
+            worker.feed(conn, client_fd);
+        }
+    } catch (...) { recoverable_error(std::current_exception(), -1); }
+}
+
+
+void ConnPool::conn_server_tcp(const conn_t &conn, int fd, int events) {
     try {
         if (send(fd, "", 0, 0) == 0)
         {
@@ -356,7 +419,52 @@ void ConnPool::conn_server(const conn_t &conn, int fd, int events) {
     }
 }
 
-void ConnPool::_listen(NetAddr listen_addr) {
+void ConnPool::conn_server(const conn_t &conn, int fd, int events) {
+
+    try {
+        /* This line apparently relies on some TCP (and TCP stack
+         * implementation) specific behavior. While a send call with zero
+         * length would in UDP result in a zero payload message, in TCP it
+         * doesn't necessarily does, due to the stream orientation. In the SCTP
+         * stack, a zero length send call is even invalid, so we have to replace
+         * it with something different here.. Checking SCTP assoc status instead
+         */
+//        if (send(fd, "", 0, 0) == 0)
+        struct sctp_status sstate;
+        memset(&sstate, 0, sizeof(struct sctp_status));
+
+        int ret;
+        socklen_t opt_len = (socklen_t) sizeof(struct sctp_status);
+        if (ret = ::getsockopt(fd,
+                               IPPROTO_SCTP,
+                               SCTP_STATUS,
+                               &sstate,
+                               &opt_len) < 0){
+            SALTICIDAE_LOG_DEBUG("Failed to acquire SCTP socket status: %s", strerror(errno));
+            throw SalticidaeError(SALTI_ERROR_CONNECT, errno);
+        }
+
+        if (sstate.sstat_state == SCTP_ESTABLISHED) {
+            conn->ev_connect.del();
+            SALTICIDAE_LOG_DEBUG("connected to remote %s", std::string(*conn).c_str());
+            auto &worker = select_worker();
+            conn->worker = &worker;
+            worker.feed(conn, fd);
+        }
+        else
+        {
+            if (events & TimedFdEvent::TIMEOUT)
+                SALTICIDAE_LOG_INFO("%s connect timeout", std::string(*conn).c_str());
+            throw SalticidaeError(SALTI_ERROR_CONNECT, errno);
+        }
+    } catch (...) {
+        disp_terminate(conn);
+        recoverable_error(std::current_exception(), -1);
+    }
+}
+
+
+void ConnPool::_listen_tcp(NetAddr listen_addr) {
     int one = 1;
     if (listen_fd != -1)
     { /* reset the previous listen() */
@@ -382,12 +490,47 @@ void ConnPool::_listen(NetAddr listen_addr) {
     if (::listen(listen_fd, max_listen_backlog) < 0)
         throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
     ev_listen = FdEvent(disp_ec, listen_fd,
+                std::bind(&ConnPool::accept_client_tcp, this, _1, _2));
+    ev_listen.add(FdEvent::READ);
+    SALTICIDAE_LOG_INFO("listening to %u", ntohs(listen_addr.port));
+}
+
+void ConnPool::_listen(NetAddr listen_addr) {
+    int one = 1;
+
+    if (listen_fd != -1)
+    { /* reset the previous listen() */
+        ev_listen.clear();
+        close(listen_fd);
+    }
+    if ((listen_fd = socket(PF_INET, SOCK_STREAM, IPPROTO_SCTP)) < 0)
+        throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one)) < 0)
+        throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
+
+    configure_sctp_socket(listen_fd, SALTI_ERROR_LISTEN);
+
+    if (fcntl(listen_fd, F_SETFL, O_NONBLOCK) == -1)
+        throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
+
+    struct sockaddr_in sockin;
+    memset(&sockin, 0, sizeof(struct sockaddr_in));
+    sockin.sin_family = AF_INET;
+    sockin.sin_addr.s_addr = INADDR_ANY;
+    sockin.sin_port = listen_addr.port;
+
+    if (bind(listen_fd, (struct sockaddr *)&sockin, sizeof(sockin)) < 0)
+        throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
+    if (::listen(listen_fd, max_listen_backlog) < 0)
+        throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
+    ev_listen = FdEvent(disp_ec, listen_fd,
                 std::bind(&ConnPool::accept_client, this, _1, _2));
     ev_listen.add(FdEvent::READ);
     SALTICIDAE_LOG_INFO("listening to %u", ntohs(listen_addr.port));
 }
 
-ConnPool::conn_t ConnPool::_connect(const NetAddr &addr) {
+
+ConnPool::conn_t ConnPool::_connect_tcp(const NetAddr &addr) {
     int fd;
     int one = 1;
     if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0)
@@ -422,9 +565,57 @@ ConnPool::conn_t ConnPool::_connect(const NetAddr &addr) {
     else
     {
         conn->ev_connect = TimedFdEvent(disp_ec, conn->fd, [this, conn](int fd, int events) {
+            conn_server_tcp(conn, fd, events);
+        });
+        conn->ev_connect.add(FdEvent::WRITE, conn_server_timeout);
+        SALTICIDAE_LOG_INFO("created %s", std::string(*conn).c_str());
+    }
+    return conn;
+}
+
+ConnPool::conn_t ConnPool::_connect(const NetAddr &addr) {
+    int fd;
+    int one = 1;
+
+    if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)) < 0)
+        throw ConnPoolError(SALTI_ERROR_CONNECT, errno);
+
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one)) < 0)
+        throw ConnPoolError(SALTI_ERROR_CONNECT, errno);
+
+    configure_sctp_socket(fd, SALTI_ERROR_CONNECT);
+
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
+        throw ConnPoolError(SALTI_ERROR_CONNECT, errno);
+    conn_t conn = create_conn();
+    conn->send_buffer.set_capacity(max_send_buff_size);
+    conn->recv_chunk_size = recv_chunk_size;
+    conn->max_recv_buff_size = max_recv_buff_size;
+    conn->fd = fd;
+    conn->cpool = this;
+    conn->mode = Conn::ACTIVE;
+    conn->addr = addr;
+    add_conn(conn);
+
+    struct sockaddr_in sockin;
+    memset(&sockin, 0, sizeof(struct sockaddr_in));
+    sockin.sin_family = AF_INET;
+    sockin.sin_addr.s_addr = addr.ip;
+    sockin.sin_port = addr.port;
+
+    if (::connect(fd, (struct sockaddr *)&sockin,
+                sizeof(struct sockaddr_in)) < 0 && errno != EINPROGRESS)
+    {
+        SALTICIDAE_LOG_INFO("cannot connect to %s", std::string(addr).c_str());
+        disp_terminate(conn);
+    }
+    else
+    {
+        conn->ev_connect = TimedFdEvent(disp_ec, conn->fd, [this, conn](int fd, int events) {
             conn_server(conn, fd, events);
         });
         conn->ev_connect.add(FdEvent::WRITE, conn_server_timeout);
+
         SALTICIDAE_LOG_INFO("created %s", std::string(*conn).c_str());
     }
     return conn;

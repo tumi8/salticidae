@@ -163,7 +163,9 @@ class ConnPool {
 
     int32_t gen_async_id() { return async_id.fetch_add(1, std::memory_order_relaxed); }
     conn_t _connect(const NetAddr &addr);
+    conn_t _connect_tcp(const NetAddr &addr);
     void _listen(NetAddr listen_addr);
+    void _listen_tcp(NetAddr listen_addr);
     void recoverable_error(const std::exception_ptr err, int32_t id) const {
         user_tcall->async_call([this, err, id](ThreadCall::Handle &) {
             if (error_cb) error_cb(err, false, id);
@@ -362,8 +364,12 @@ class ConnPool {
     size_t nworker;
     salticidae::BoxObj<Worker[]> workers;
 
+    /* Configure given fd with sock options, throw SaltiErrorCode exc on error*/
+    void configure_sctp_socket(int, SalticidaeErrorCode);
     void accept_client(int, int);
+    void accept_client_tcp(int, int);
     void conn_server(const conn_t &conn, int, int);
+    void conn_server_tcp(const conn_t &conn, int, int);
     conn_t add_conn(const conn_t &conn);
     void del_conn(const conn_t &conn);
     void release_conn(const conn_t &conn);
@@ -589,6 +595,17 @@ class ConnPool {
     }
 
     /** Actively connect to remote addr. */
+    conn_t connect_sync_tcp(const NetAddr &addr) {
+        auto ret = *(static_cast<conn_t *>(
+                    disp_tcall->call([this, addr](ThreadCall::Handle &h) {
+            conn_t conn;
+            conn = _connect_tcp(addr);
+            h.set_result(conn);
+        }).get()));
+        return ret;
+    }
+
+    /** Actively connect to remote addr. */
     conn_t connect_sync(const NetAddr &addr) {
         auto ret = *(static_cast<conn_t *>(
                     disp_tcall->call([this, addr](ThreadCall::Handle &h) {
@@ -621,6 +638,16 @@ class ConnPool {
             _listen(listen_addr);
         }).get();
     }
+
+    /** Listen for passive connections (connection initiated from remote).
+     * Does not need to be called if do not want to accept any passive
+     * connections. */
+    void listen_tcp(NetAddr listen_addr) {
+        disp_tcall->call([this, listen_addr](ThreadCall::Handle &) {
+            _listen_tcp(listen_addr);
+        }).get();
+    }
+
 
     template<typename Func>
     void reg_conn_handler(Func &&cb) { conn_cb = std::forward<Func>(cb); }
