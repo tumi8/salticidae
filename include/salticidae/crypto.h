@@ -138,6 +138,7 @@ static int _skip_CA_check(int, X509_STORE_CTX *) {
 class PKey {
     EVP_PKEY *key;
     friend class TLSContext;
+    friend class DTLSContext;
     friend class X509;
     public:
     PKey(EVP_PKEY *key): key(key) {}
@@ -228,6 +229,7 @@ class PKey {
 class X509 {
     ::X509 *x509;
     friend class TLSContext;
+    friend class DTLSContext;
     public:
     X509(::X509 *x509): x509(x509) {}
     X509(const X509 &) = delete;
@@ -313,7 +315,7 @@ class TLSContext {
     SSL_CTX *ctx;
     friend class TLS;
     public:
-    TLSContext(): ctx(SSL_CTX_new(TLS_method())) {
+    TLSContext(): ctx(SSL_CTX_new(TLS_method())) { // to change into DTLS_method() for udp
         if (ctx == nullptr)
             throw std::runtime_error("TLSContext init error");
     }
@@ -367,10 +369,10 @@ class TLS {
             throw std::runtime_error("TLS init error");
         if (!SSL_set_fd(ssl, fd))
             throw SalticidaeError(SALTI_ERROR_TLS_GENERIC);
-        if (accept)
-            SSL_set_accept_state(ssl);
+        if (accept) // decided in feed based on connection mode
+            SSL_set_accept_state(ssl); // server mode; connection mode passive
         else
-            SSL_set_connect_state(ssl);
+            SSL_set_connect_state(ssl); // client mode; connection mode active, currently all replicas should be in this mode
     }
 
     TLS(const TLS &) = delete;
@@ -386,8 +388,10 @@ class TLS {
             want_io_type = 1;
         else if (err == SSL_ERROR_WANT_READ)
             want_io_type = 0;
-        else
+        else {
+            SALTICIDAE_LOG_INFO("Handshake error!");
             throw SalticidaeError(SALTI_ERROR_TLS_GENERIC);
+        }
         return false;
     }
 
@@ -413,6 +417,128 @@ class TLS {
     void shutdown() { SSL_shutdown(ssl); }
 
     ~TLS() { if (ssl) SSL_free(ssl); }
+};
+
+//separate DTLS context from TLS, not much changes, but allows for DTLS modification without causing client communication based on TLS to fail
+class DTLSContext {
+    SSL_CTX *ctx;
+    friend class DTLS;
+    public:
+    DTLSContext(): ctx(SSL_CTX_new(DTLS_method())) { // to change into DTLS_method() for udp
+        if (ctx == nullptr)
+            throw std::runtime_error("DTLSContext init error");
+
+        //activate those options when cookie functions are implemented in class DTLS
+        //SSL_CTX_set_cookie_generate_cb(ctx, generate_cookie);
+        //SSL_CTX_set_cookie_verify_cb(ctx, verify_cookie);
+    }
+
+    DTLSContext(const DTLSContext &) = delete;
+    DTLSContext(DTLSContext &&other): ctx(other.ctx) { other.ctx = nullptr; }
+
+    void use_cert_file(const std::string &fname) {
+        auto ret = SSL_CTX_use_certificate_file(ctx, fname.c_str(), SSL_FILETYPE_PEM);
+        if (ret <= 0)
+            throw SalticidaeError(SALTI_ERROR_TLS_LOAD_CERT);
+    }
+
+    void use_cert(const X509 &x509) {
+        auto ret = SSL_CTX_use_certificate(ctx, x509.x509);
+        if (ret <= 0)
+            throw SalticidaeError(SALTI_ERROR_TLS_LOAD_CERT);
+    }
+
+    void use_privkey_file(const std::string &fname) {
+        auto ret = SSL_CTX_use_PrivateKey_file(ctx, fname.c_str(), SSL_FILETYPE_PEM);
+        if (ret <= 0)
+            throw SalticidaeError(SALTI_ERROR_TLS_LOAD_KEY);
+    }
+
+    void use_privkey(const PKey &key) {
+        auto ret = SSL_CTX_use_PrivateKey(ctx, key.key);
+        if (ret <= 0)
+            throw SalticidaeError(SALTI_ERROR_TLS_LOAD_KEY);
+    }
+
+    void set_verify(bool skip_ca_check = true, SSL_verify_cb verify_callback = nullptr) {
+        SSL_CTX_set_verify(ctx,
+                SSL_VERIFY_PEER, skip_ca_check ? _skip_CA_check : verify_callback);
+    }
+
+    bool check_privkey() {
+        return SSL_CTX_check_private_key(ctx) > 0;
+    }
+
+    ~DTLSContext() { if (ctx) SSL_CTX_free(ctx); }
+};
+
+using dtls_context_t = ArcObj<DTLSContext>;
+
+class DTLS {
+    public:
+    SSL *ssl;
+    DTLS(const dtls_context_t &ctx, int fd, bool accept): ssl(SSL_new(ctx->ctx)) {
+        if (ssl == nullptr)
+            throw std::runtime_error("DTLS init error");
+        if (!SSL_set_fd(ssl, fd))
+            throw SalticidaeError(SALTI_ERROR_TLS_GENERIC);
+        //SSL_set_options(ssl, SSL_OP_COOKIE_EXCHANGE); // this option would enable cookie sending --> need to implement cookie generator and verificator
+        if (accept) // decided in feed based on connection mode
+            SSL_set_accept_state(ssl); // server mode; connection mode passive
+        else
+            SSL_set_connect_state(ssl); // client mode; connection mode active, currently all replicas should be in this mode
+    }
+
+    DTLS(const DTLS &) = delete;
+    DTLS(DTLS &&other): ssl(other.ssl) { other.ssl = nullptr; }
+
+    /* Generate cookie. Returns 1 on success, 0 otherwise */
+    int generate_cookie(SSL *ssl, unsigned char *cookie, unsigned int *cookie_len);
+
+    /* Verify cookie. Returns 1 on success, 0 otherwise */
+    int verify_cookie(SSL *ssl, unsigned char *cookie, unsigned int cookie_len);
+
+    bool do_handshake(int &want_io_type) {
+        /* want_io_type: 0 for read, 1 for write */
+        /* return true if handshake is completed */
+        auto ret = SSL_do_handshake(ssl);
+        if (ret == 1) return true;
+        auto err = SSL_get_error(ssl, ret);
+        //SALTICIDAE_LOG_INFO("Handshake is not finished, error is: %d",err);
+        if (err == SSL_ERROR_WANT_WRITE)
+        {
+            want_io_type = 1;
+            //SALTICIDAE_LOG_INFO("SSL_ERROR_WANT_WRITE => SSL_connect");
+        }
+        else if (err == SSL_ERROR_WANT_READ)
+            want_io_type = 0;
+        /*else
+            throw SalticidaeError(SALTI_ERROR_TLS_GENERIC);*/
+        return false;
+    }
+
+    X509 get_peer_cert() {
+        ::X509 *x509 = SSL_get_peer_certificate(ssl);
+        if (x509 == nullptr)
+            throw SalticidaeError(SALTI_ERROR_TLS_GENERIC);
+        return X509(x509);
+    }
+
+    inline int send(const void *buff, size_t size) {
+        return SSL_write(ssl, buff, size);
+    }
+
+    inline int recv(void *buff, size_t size) {
+        return SSL_read(ssl, buff, size);
+    }
+
+    int get_error(int ret) {
+        return SSL_get_error(ssl, ret);
+    }
+
+    void shutdown() { SSL_shutdown(ssl); }
+
+    ~DTLS() { if (ssl) SSL_free(ssl); }
 };
 
 }

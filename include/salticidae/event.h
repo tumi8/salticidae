@@ -94,10 +94,17 @@ class FdEvent {
     uv_poll_t *ev_fd;
     callback_t callback;
 
+    //modified mainly for debugging, not sure if reverting UV_EBADF causes problems; --> related to libuv (http://docs.libuv.org/en/v1.x/)
     static inline void fd_then(uv_poll_t *h, int status, int events) {
-        if (status != 0)
-            events |= ERROR;
+        if (status != 0){
+            //SALTICIDAE_LOG_INFO("ERROR in FdEvent: %s", uv_strerror(status));
+            if(status != UV_EBADF) // ignore UV_EBADF error; custom change
+                events |= ERROR;
+        }
         auto event = static_cast<FdEvent *>(h->data);
+        if (status != 0){
+            //SALTICIDAE_LOG_INFO("The bad fd is %d", event->fd);
+        }
         event->callback(event->fd, events);
     }
 
@@ -268,8 +275,10 @@ class TimedFdEvent: public FdEvent, public TimerEvent {
     }
 
     static inline void fd_then(uv_poll_t *h, int status, int events) {
-        if (status != 0)
+        if (status != 0){
+            //SALTICIDAE_LOG_INFO("ERROR in TimedFdEvent: %s", uv_strerror(status));
             events |= ERROR;
+        }
         auto event = static_cast<TimedFdEvent *>(h->data);
         event->TimerEvent::del();
         if (uv_timer_start(event->ev_timer, TimedFdEvent::timer_then,
@@ -557,7 +566,8 @@ class NotifyFd {
         uint64_t _;
         return read(fd, &_, 8) == 8;
     }
-    void notify() { write(fd, &dummy, 8); }
+    void notify() { if(!write(fd, &dummy, 8))
+                        throw SalticidaeError(SALTI_ERROR_FD);}// compiler warning when not throwing error, not sure why not necessary in original implementation
     int read_fd() { return fd; }
     ~NotifyFd() { close(fd); }
 };
@@ -635,7 +645,7 @@ class MPSCQueueEventDriven: public MPSCQueue<T> {
         // memory barrier here, so any load/store in enqueue must be finialized
         if (wait_sig.exchange(false, std::memory_order_acq_rel))
         {
-            //SALTICIDAE_LOG_DEBUG("mpsc notify");
+            SALTICIDAE_LOG_DEBUG("mpsc notify");
             nfd.notify();
         }
         return true;

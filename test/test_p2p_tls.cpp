@@ -71,8 +71,8 @@ struct MsgText {
 const uint8_t MsgText::opcode;
 
 void masksigs() {
-	sigset_t mask;
-	sigemptyset(&mask);
+    sigset_t mask;
+    sigemptyset(&mask);
     sigfillset(&mask);
     pthread_sigmask(SIG_BLOCK, &mask, NULL);
 }
@@ -91,9 +91,10 @@ struct Net {
     Net(uint64_t id, uint16_t port): id(id), tc(ec), listen_addr("127.0.0.1:"+ std::to_string(port)) {
         auto tls_key = new PKey(PKey::create_privkey_rsa(2048));
         auto tls_cert = new salticidae::X509(salticidae::X509::create_self_signed_from_pubkey(*tls_key));
-        tls_key->save_privkey_to_file(std::to_string(port) + "_pkey.pem");
-        tls_cert->save_to_file(std::to_string(port) + ".pem");
+        tls_key->save_privkey_to_file("tls_pkey.pem");
+        tls_cert->save_to_file("tlscert.pem");
         cert = salticidae::get_hash(tls_cert->get_der());
+        cert->save_to_file("certhash.cert");
         valid_certs.insert(cert);
         net = new PeerNetwork(ec, PeerNetwork::Config(salticidae::ConnPool::Config()
                     .enable_tls(true)

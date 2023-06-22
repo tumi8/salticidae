@@ -81,7 +81,7 @@ struct NetAddr {
         ip = addr_sock->sin_addr.s_addr;
         port = addr_sock->sin_port;
     }
-    
+
     bool operator==(const NetAddr &other) const {
         return ip == other.ip && port == other.port;
     }
@@ -89,8 +89,17 @@ struct NetAddr {
     bool operator!=(const NetAddr &other) const {
         return ip != other.ip || port != other.port;
     }
-   
+
     operator std::string() const {
+        struct in_addr in;
+        in.s_addr = ip;
+        DataStream s;
+        s << "<NetAddr " << std::string(inet_ntoa(in))
+          << ":" << std::to_string(ntohs(port)) << ">";
+        return std::string(std::move(s));
+    }
+    //custom utility function for debugging utilizing log files
+    std::string convert_string() {
         struct in_addr in;
         in.s_addr = ip;
         DataStream s;

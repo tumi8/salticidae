@@ -28,6 +28,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdexcept>
 #include "salticidae/config.h"
 
 typedef struct SalticidaeCError {

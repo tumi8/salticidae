@@ -168,7 +168,7 @@ class MsgNetwork: public ConnPool {
         Config(): Config(ConnPool::Config()) {}
         Config(const ConnPool::Config &config):
             ConnPool::Config(config),
-            _max_msg_size(1024),
+            _max_msg_size(65536), // increased variable from 1024 to 65536 for enabling higher batchsizes
             _max_msg_queue_size(65536),
             _burst_size(1000),
             _msg_magic(0x0) {}
@@ -482,6 +482,10 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
     const char *tty_tertiary_color;
     const char *tty_reset_color;
 
+    public:
+    bool is_enable_tls(){return MsgNet::enable_tls;};
+    bool is_enable_dtls(){return MsgNet::enable_dtls;};
+
     struct MsgPing {
         static const OpcodeType opcode;
         DataStream serialized;
@@ -514,7 +518,7 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
     void _pong_msg_cb(const conn_t &conn, uint16_t port);
     void finish_handshake(Peer *peer);
     void replace_pending_conn(const conn_t &conn);
-    void start_active_conn(Peer *peer);
+    void start_active_conn(Peer *peer, const NetAddr &listen_addr);
     static void tcall_reset_timeout(ConnPool::Worker *worker,
                                     const conn_t &conn, double timeout);
     inline conn_t _get_peer_conn(const PeerId &peer) const;
@@ -526,11 +530,13 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
     void on_dispatcher_setup(const ConnPool::conn_t &) override;
     void on_dispatcher_teardown(const ConnPool::conn_t &) override;
 
+    //modified for considering dtls for PeerId mechanism
     PeerId _get_peer_id(const X509 *cert, const NetAddr &addr) {
-        if (!this->enable_tls || id_mode == ADDR_BASED)
+        if (!(this->enable_tls || this->enable_dtls) || id_mode == ADDR_BASED)
             return PeerId(addr);
-        else
+        else{
             return PeerId(*cert);
+        }
     }
 
     PeerId get_peer_id(const conn_t &conn, const NetAddr &addr) {
@@ -566,7 +572,7 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
             return *this;
         }
 
-        Config &id_mode(IdentityMode x) {
+        Config &id_mode(IdentityMode x) { //e.g. ADDR_BASED
             _id_mode = x;
             return *this;
         }
@@ -594,8 +600,9 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
             tty_tertiary_color = TTY_COLOR_YELLOW;
             tty_reset_color = TTY_COLOR_RESET;
         }
-        this->reg_handler(generic_bind(&PeerNetwork::ping_handler, this, _1, _2));
-        this->reg_handler(generic_bind(&PeerNetwork::pong_handler, this, _1, _2));
+        //deactivate ping and pong heratbeat mechanism for UDP
+        //this->reg_handler(generic_bind(&PeerNetwork::ping_handler, this, _1, _2));
+        //this->reg_handler(generic_bind(&PeerNetwork::pong_handler, this, _1, _2));
     }
 
     virtual ~PeerNetwork() { this->stop(); }
@@ -607,7 +614,7 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
     /* set the peer's public IP */
     int32_t set_peer_addr(const PeerId &peer, const NetAddr &addr);
     /* try to connect to the peer: once (ntry = 1), indefinitely (ntry = -1), give up retry (ntry = 0) */
-    int32_t conn_peer(const PeerId &peer, int32_t ntry = -1, double retry_delay = 2);
+    int32_t conn_peer(const PeerId &peer,const NetAddr &listen_addr = NetAddr("0.0.0.0:9999"), int32_t ntry = -1, double retry_delay = 2);
     /* check if a peer is registered */
     bool has_peer(const PeerId &peer) const;
 
@@ -652,9 +659,12 @@ void MsgNetwork<OpcodeType>::on_read(const ConnPool::conn_t &_conn) {
             if (msg.get_length() > max_msg_size)
             {
                 SALTICIDAE_LOG_WARN(
-                        "oversized message from %s, terminating the connection",
+                        "oversized message of size %d from %s, terminating the connection", msg.get_length(),
                         std::string(*conn).c_str());
-                throw MsgNetworkError(SALTI_ERROR_CONN_OVERSIZED_MSG);
+                //next lines added by me to account for out of order large DTLS messages
+                //throw MsgNetworkError(SALTI_ERROR_CONN_OVERSIZED_MSG);
+                msg_state = Conn::HEADER;
+                break;
             }
             msg_state = Conn::PAYLOAD;
         }
@@ -717,6 +727,7 @@ inline bool MsgNetwork<OpcodeType>::send_msg(const MsgType &msg, const conn_t &c
 
 template<typename OpcodeType>
 inline bool MsgNetwork<OpcodeType>::_send_msg(const Msg &msg, const conn_t &conn) {
+    //SALTICIDAE_LOG_INFO("in _send_msg");
     bytearray_t msg_data = msg.serialize();
     SALTICIDAE_LOG_DEBUG("wrote message %s to %s",
                 std::string(msg).c_str(),
@@ -743,6 +754,7 @@ void PeerNetwork<O, _, __>::tcall_reset_timeout(ConnPool::Worker *worker,
 
 template<typename O, O _, O __>
 void PeerNetwork<O, _, __>::on_worker_setup(const ConnPool::conn_t &_conn) {
+    //SALTICIDAE_LOG_INFO("on_worker_setup was called");
     MsgNet::on_worker_setup(_conn);
     auto conn = static_pointer_cast<Conn>(_conn);
     auto worker = conn->worker;
@@ -754,6 +766,7 @@ void PeerNetwork<O, _, __>::on_worker_setup(const ConnPool::conn_t &_conn) {
                 tty_secondary_color,
                 id_hex.c_str(),
                 tty_reset_color);
+            //SALTICIDAE_LOG_INFO("worker_terminate called in on_worker_setup");
             this->worker_terminate(conn);
         } catch (...) { worker->error_callback(std::current_exception()); }
     });
@@ -769,8 +782,10 @@ void PeerNetwork<O, _, __>::on_worker_teardown(const ConnPool::conn_t &_conn) {
 /* begin: functions invoked by the dispatcher */
 
 /* the initial ping-pong to set up the connection */
+// removed connection timeout and ping/pong
 template<typename O, O _, O __>
 void PeerNetwork<O, _, __>::on_dispatcher_setup(const ConnPool::conn_t &_conn) {
+    //SALTICIDAE_LOG_INFO("PeerNetwork<O, _, __>::on_dispatcher_setup was called");
     MsgNet::on_dispatcher_setup(_conn);
     auto conn = static_pointer_cast<Conn>(_conn);
     SALTICIDAE_LOG_INFO("%s%s%s: setup connection %s",
@@ -778,23 +793,34 @@ void PeerNetwork<O, _, __>::on_dispatcher_setup(const ConnPool::conn_t &_conn) {
             id_hex.c_str(),
             tty_reset_color,
             std::string(*conn).c_str());
-    tcall_reset_timeout(conn->worker, conn, conn_timeout);
+    //tcall_reset_timeout(conn->worker, conn, conn_timeout);
+    conn->ev_timeout.del();
     if (conn->get_mode() == Conn::ConnMode::ACTIVE)
     {
         auto pid = get_peer_id(conn, conn->get_addr());
         auto it = known_peers.find(pid);
-        if (it == known_peers.end())
+        if (it == known_peers.end()){
+            for(auto const& p: known_peers){
+                //SALTICIDAE_LOG_INFO("loop and print peers: %s", salticidae::get_hex(p.first).c_str());
+            }
+            //SALTICIDAE_LOG_INFO("didnt find peer; in total %d peers", known_peers.size());
             throw PeerNetworkError(SALTI_ERROR_PEER_NOT_MATCH);
+        }
         else
         {
             pinfo_slock_t _g(known_peers_lock);
+            /*
             send_msg(MsgPing(
                 listen_addr,
                 it->second->get_nonce()), conn);
+            SALTICIDAE_LOG_INFO("PingMsg sent");
+            */
         }
     }
-    else
+    else{
+        //SALTICIDAE_LOG_INFO("replace_pending_conn called");
         replace_pending_conn(conn);
+    }
 }
 
 template<typename O, O _, O __>
@@ -848,11 +874,12 @@ void PeerNetwork<O, _, __>::on_dispatcher_teardown(const ConnPool::conn_t &_conn
         p->nonce = passive_nonce;
 }
 
+//modified to prevent ping mechanism
 template<typename O, O _, O __>
 void PeerNetwork<O, _, __>::Peer::reset_ping_timer() {
     assert(ev_ping_timer);
     ev_ping_timer.del();
-    ev_ping_timer.add(gen_rand_timeout(ping_period));
+    //ev_ping_timer.add(gen_rand_timeout(ping_period));
 }
 
 template<typename O, O _, O __>
@@ -874,6 +901,7 @@ void PeerNetwork<O, _, __>::Peer::ping_timer(TimerEvent &) {
     }
 }
 
+//modified to prevent ping mechanism
 template<typename O, O _, O __>
 void PeerNetwork<O, _, __>::finish_handshake(Peer *p) {
     assert(p->state == Peer::State::DISCONNECTED);
@@ -887,7 +915,7 @@ void PeerNetwork<O, _, __>::finish_handshake(Peer *p) {
     }
     p->state = Peer::State::CONNECTED;
     p->reset_ping_timer();
-    p->send_ping();
+    //p->send_ping();
     p->ev_retry_timer.del();
     p->cur_ntry = p->ntry;
     auto &old_conn = p->conn;
@@ -900,7 +928,7 @@ void PeerNetwork<O, _, __>::finish_handshake(Peer *p) {
         {
             bytearray_t buff_seg = old_conn->send_buffer.move_pop();
             if (!buff_seg.size()) break;
-            new_conn->write(std::move(buff_seg));
+            new_conn->write(std::move(buff_seg)); //bool write(bytearray_t &&data) {} in conn.h
         }
         old_conn->peer = nullptr;
     }
@@ -931,6 +959,7 @@ void PeerNetwork<O, _, __>::replace_pending_conn(const conn_t &conn) {
         auto &old_conn = it->second;
         if (old_conn != conn)
         {
+            //SALTICIDAE_LOG_INFO("disp_terminate called in replace_pending_conn");
             this->disp_terminate(old_conn);
             pending_peers.erase(it);
         }
@@ -939,11 +968,17 @@ void PeerNetwork<O, _, __>::replace_pending_conn(const conn_t &conn) {
 }
 
 template<typename O, O _, O __>
-void PeerNetwork<O, _, __>::start_active_conn(Peer *p) {
+//here I switched to udp implementation
+void PeerNetwork<O, _, __>::start_active_conn(Peer *p,const NetAddr &listen_addr) {
+    //SALTICIDAE_LOG_INFO("start_active_conn(Peer *p) called");
     assert(!p->addr.is_null());
-    auto conn = static_pointer_cast<Conn>(MsgNet::_connect(p->addr));
+    auto conn = static_pointer_cast<Conn>(MsgNet::_connect_udp(p->addr, listen_addr)); // changed here to udp connect
     conn->peer = p;
-    p->outbound_conn = conn;
+    p->chosen_conn = conn; //use only one socket
+    //SALTICIDAE_LOG_INFO("next finish_handshake(p);");
+    finish_handshake(p); //pretend ping pong handshake happened
+    //p->outbound_conn = conn; not outbound but chosen connection
+
     assert(pending_peers.count(conn->get_addr()) == 0);
 }
 
@@ -978,6 +1013,7 @@ void PeerNetwork<O, _, __>::ping_handler(MsgPing &&msg, const conn_t &conn) {
                             "%s%s%s: %s%s%s does not match the record",
                             tty_secondary_color, id_hex.c_str(), tty_reset_color,
                             tty_secondary_color, get_hex10(pid).c_str(), tty_reset_color);
+                        //SALTICIDAE_LOG_INFO("disp_terminate called in ping_handler");
                         this->disp_terminate(conn);
                         return;
                     }
@@ -995,12 +1031,13 @@ void PeerNetwork<O, _, __>::ping_handler(MsgPing &&msg, const conn_t &conn) {
                             tty_secondary_color, id_hex.c_str(), tty_reset_color,
                             std::string(*old_conn).c_str());
                         assert(old_conn->peer == nullptr);
+                        //SALTICIDAE_LOG_INFO("disp_terminate called in ping_handler");
                         this->disp_terminate(old_conn);
                     }
                     old_conn = conn;
                     if (msg.nonce < p->get_nonce() || p->addr.is_null())
                     {
-                        SALTICIDAE_LOG_DEBUG("%s%s%s: choses connection %s",
+                        SALTICIDAE_LOG_DEBUG("%s%s%s: choose connection %s",
                             tty_secondary_color, id_hex.c_str(), tty_reset_color,
                             std::string(*conn).c_str());
                         p->chosen_conn = conn;
@@ -1011,6 +1048,7 @@ void PeerNetwork<O, _, __>::ping_handler(MsgPing &&msg, const conn_t &conn) {
                         SALTICIDAE_LOG_DEBUG("%s%s%s: terminates one side (%04x >= %04x)",
                             tty_secondary_color, id_hex.c_str(), tty_reset_color,
                             msg.nonce, p->get_nonce());
+                        //SALTICIDAE_LOG_INFO("disp_terminate called in pin_handler");
                         this->disp_terminate(conn);
                     }
                 }
@@ -1048,6 +1086,7 @@ void PeerNetwork<O, _, __>::pong_handler(MsgPong &&msg, const conn_t &conn) {
                             "%s%s%s: %s%s%s does not match the record",
                             tty_secondary_color, id_hex.c_str(), tty_reset_color,
                             tty_secondary_color, get_hex10(pid).c_str(), tty_reset_color);
+                        //SALTICIDAE_LOG_INFO("disp_terminate called in pong_handler");
                         this->disp_terminate(conn);
                         return;
                     }
@@ -1065,6 +1104,7 @@ void PeerNetwork<O, _, __>::pong_handler(MsgPong &&msg, const conn_t &conn) {
                             tty_secondary_color, id_hex.c_str(), tty_reset_color,
                             std::string(*old_conn).c_str());
                         assert(old_conn->peer == nullptr);
+                        //SALTICIDAE_LOG_INFO("disp_terminate called in pong_handler");
                         this->disp_terminate(old_conn);
                     }
                     old_conn = conn;
@@ -1082,6 +1122,7 @@ void PeerNetwork<O, _, __>::pong_handler(MsgPong &&msg, const conn_t &conn) {
                         SALTICIDAE_LOG_DEBUG("%s%s%s: terminates one side (%04x >= %04x)",
                             tty_secondary_color, id_hex.c_str(), tty_reset_color,
                             p->get_nonce(), msg.nonce);
+                        //SALTICIDAE_LOG_INFO("disp_terminate called in pong_handler");
                         this->disp_terminate(conn);
                     }
                 }
@@ -1110,10 +1151,12 @@ void PeerNetwork<O, _, __>::pong_handler(MsgPong &&msg, const conn_t &conn) {
     });
 }
 
+//modified but not used anymore, pn.listen got disabled
 template<typename O, O _, O __>
-void PeerNetwork<O, _, __>::listen(NetAddr _listen_addr) {
+void PeerNetwork<O, _, __>::listen(NetAddr _listen_addr) { // this is calles by pn.listen in HotStuffBase::HotStuffBase
     this->disp_tcall->call([this, _listen_addr](ThreadCall::Handle &) {
-        MsgNet::_listen(_listen_addr);
+        //MsgNet::_listen(_listen_addr);
+        MsgNet::_listen_udp(_listen_addr); // new udp socket
         listen_addr = _listen_addr;
         auto my_cert = this->tls_cert;
         id = _get_peer_id(my_cert ? my_cert.get() : nullptr, listen_addr);
@@ -1144,10 +1187,13 @@ int32_t PeerNetwork<O, _, __>::add_peer(const PeerId &pid) {
     return id;
 }
 
+// first function called for establishing peer connection; removed retries and connection termination
+// logic continued in start_active_conn(p.get(),listen_addr);
 template<typename O, O _, O __>
-int32_t PeerNetwork<O, _, __>::conn_peer(const PeerId &pid, int32_t ntry, double retry_delay) {
+int32_t PeerNetwork<O, _, __>::conn_peer(const PeerId &pid, const NetAddr &listen_addr, int32_t ntry, double retry_delay) {
+    //SALTICIDAE_LOG_INFO("peer connecting -> network.h: conn_peer");
     auto id = this->gen_async_id();
-    this->disp_tcall->async_call([this, pid, ntry, retry_delay, id](ThreadCall::Handle &) {
+    this->disp_tcall->async_call([this, pid, ntry, retry_delay, id, listen_addr](ThreadCall::Handle &) {
         try {
             pinfo_slock_t _g(known_peers_lock);
             auto it = known_peers.find(pid);
@@ -1163,16 +1209,19 @@ int32_t PeerNetwork<O, _, __>::conn_peer(const PeerId &pid, int32_t ntry, double
             p->outbound_conn = nullptr;
             p->ev_ping_timer.del();
             p->nonce = 0;
-            p->ev_retry_timer = TimerEvent(this->disp_ec,
+            start_active_conn(p.get(),listen_addr);
+            //SALTICIDAE_LOG_INFO("finished conn_peer");
+            /*p->ev_retry_timer = TimerEvent(this->disp_ec,
                     [this, addr=p->addr, p=p.get()](TimerEvent &) {
                 try {
                     start_active_conn(p);
                     p->ev_retry_timer.add(gen_rand_timeout(p->retry_delay));
                 } catch (...) { this->disp_error_cb(std::current_exception()); }
-            });
+            });*/
 
             /* has to terminate established connection *before* making the next
              * attempt */
+             /*
             if (p->state == Peer::State::DISCONNECTED && ntry)
                 p->ev_retry_timer.add(0);
             else if (p->state == Peer::State::CONNECTED)
@@ -1180,6 +1229,7 @@ int32_t PeerNetwork<O, _, __>::conn_peer(const PeerId &pid, int32_t ntry, double
                 p->state = Peer::State::RESET;
                 this->disp_terminate(p->conn);
             }
+            */
             // else ntry == 0 but state is not connected
             // or state is RESET
             // then it does nothing
@@ -1212,6 +1262,7 @@ int32_t PeerNetwork<O, _, __>::set_peer_addr(const PeerId &pid, const NetAddr &a
 
 template<typename O, O _, O __>
 int32_t PeerNetwork<O, _, __>::del_peer(const PeerId &pid) {
+    //SALTICIDAE_LOG_INFO("disp_terminate called in del_peer");
     auto id = this->gen_async_id();
     this->disp_tcall->async_call([this, pid, id](ThreadCall::Handle &) {
         try {

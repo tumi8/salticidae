@@ -245,7 +245,7 @@ int32_t peernetwork_del_peer(peernetwork_t *self, const peerid_t *peer) {
 }
 
 int32_t peernetwork_conn_peer(peernetwork_t *self, const peerid_t *peer, int32_t ntry, double retry_delay) {
-    return self->conn_peer(*peer, ntry, retry_delay);
+    return self->conn_peer(*peer, NetAddr("0.0.0.0:9999"), ntry, retry_delay);
 }
 
 bool peernetwork_has_peer(const peernetwork_t *self, const peerid_t *peer) {

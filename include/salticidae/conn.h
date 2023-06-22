@@ -97,15 +97,22 @@ class ConnPool {
         socket_io_func *send_data_func;
         socket_io_func *recv_data_func;
         BoxObj<TLS> tls;
+        BoxObj<DTLS> dtls;
         BoxObj<const X509> peer_cert;
 
         static socket_io_func _recv_data;
+        static socket_io_func _recv_data_udp;
         static socket_io_func _send_data;
+        static socket_io_func _send_data_udp;
 
         static socket_io_func _recv_data_tls;
+        static socket_io_func _recv_data_dtls;
         static socket_io_func _send_data_tls;
+        static socket_io_func _send_data_dtls;
         static socket_io_func _recv_data_tls_handshake;
+        static socket_io_func _recv_data_dtls_handshake;
         static socket_io_func _send_data_tls_handshake;
+        static socket_io_func _send_data_dtls_handshake;
         static socket_io_func _recv_data_dummy;
 
         public:
@@ -143,6 +150,7 @@ class ConnPool {
         /** Write data to the connection (non-blocking). The data will be sent
          * whenever I/O is available. */
         bool write(bytearray_t &&data) {
+            //SALTICIDAE_LOG_INFO("in write, !cpool->max_send_buff_size is: %d",!cpool->max_send_buff_size);
             return send_buffer.push(std::move(data), !cpool->max_send_buff_size);
         }
     };
@@ -153,7 +161,12 @@ class ConnPool {
     EventContext disp_ec;
     ThreadCall* disp_tcall;
     BoxObj<ThreadCall> user_tcall;
+    public:
+    const uint16_t index;
+    int counter;
     const bool enable_tls;
+    const bool enable_dtls;
+    protected:
     RcObj<const X509> tls_cert;
 
     using worker_error_callback_t = std::function<void(const std::exception_ptr err)>;
@@ -163,7 +176,11 @@ class ConnPool {
 
     int32_t gen_async_id() { return async_id.fetch_add(1, std::memory_order_relaxed); }
     conn_t _connect(const NetAddr &addr);
+    // adding udp _connect
+    conn_t _connect_udp(const NetAddr &addr, const NetAddr &listen_addr);
     void _listen(NetAddr listen_addr);
+    // adding udp _listen
+    void _listen_udp(NetAddr listen_addr);
     void recoverable_error(const std::exception_ptr err, int32_t id) const {
         user_tcall->async_call([this, err, id](ThreadCall::Handle &) {
             if (error_cb) error_cb(err, false, id);
@@ -187,6 +204,7 @@ class ConnPool {
     virtual void on_worker_teardown(const conn_t &conn) {
         if (conn->worker) conn->worker->unfeed();
         if (conn->tls) conn->tls->shutdown();
+        if (conn->dtls) conn->dtls->shutdown();
         conn->ev_socket.clear();
         conn->send_buffer.get_queue().unreg_handler();
     }
@@ -200,6 +218,7 @@ class ConnPool {
     const size_t max_recv_buff_size;
     const size_t max_send_buff_size;
     tls_context_t tls_ctx;
+    dtls_context_t dtls_ctx;
 
     conn_callback_t conn_cb;
     error_callback_t error_cb;
@@ -209,7 +228,9 @@ class ConnPool {
     std::unordered_map<int, conn_t> pool;
     int listen_fd;  /**< for accepting new network connections */
 
+    //modified function for UDP/DTLS using options, because shared by peer and client network
     void update_conn(const conn_t &conn, bool connected) {
+        //SALTICIDAE_LOG_INFO("update_conn was called: connected state is %s",connected ? "true" : "false");
         user_tcall->async_call([this, conn, connected](ThreadCall::Handle &) {
             bool ret = !conn_cb || conn_cb(conn, connected);
             if (connected)
@@ -225,6 +246,16 @@ class ConnPool {
                             conn->ev_socket.add(FdEvent::READ | FdEvent::WRITE);
                         }
                         else worker_terminate(conn);
+                    });
+                } // next lines added for DTLS support
+                else if (enable_dtls)
+                {
+                    conn->worker->get_tcall()->async_call([this, conn, ret](ThreadCall::Handle &) {
+                        if (conn->is_terminated()) return;
+                        conn->recv_data_func = Conn::_recv_data_dtls;
+                        //SALTICIDAE_LOG_INFO("_recv_data_dtls was successfully set as recv_data_func");
+                        conn->ev_socket.del();
+                        conn->ev_socket.add(FdEvent::READ | FdEvent::WRITE);
                     });
                 }
                 else
@@ -283,7 +314,9 @@ class ConnPool {
             });
         }
 
+        //modified function for UDP/DTLS using options, because shared by peer and client network
         void feed(const conn_t &conn, int client_fd) {
+            //SALTICIDAE_LOG_INFO("feed was called"); // from conn_server
             /* the caller should finalize all the preparation */
             tcall.async_call([this, conn, client_fd](ThreadCall::Handle &) {
                 try {
@@ -295,6 +328,7 @@ class ConnPool {
                                 conn->send_data_func(conn, fd, what);
                         } catch (...) {
                             conn->cpool->recoverable_error(std::current_exception(), -1);
+                            //SALTICIDAE_LOG_INFO("worker_terminate called in feed");
                             conn->cpool->worker_terminate(conn);
                         }
                     });
@@ -307,18 +341,41 @@ class ConnPool {
                         conn->send_data_func = Conn::_send_data_tls_handshake;
                         conn->recv_data_func = Conn::_recv_data_tls_handshake;
                         conn->ev_socket.add(FdEvent::READ | FdEvent::WRITE);
+                    } // next lines added for DTLS, also designate server/client roles for DTLS handshake
+                    else if(cpool->enable_dtls)
+                    {
+                        conn->dtls = new DTLS(
+                                cpool->dtls_ctx, client_fd,
+                                conn->mode == Conn::ConnMode::PASSIVE);
+                        conn->send_data_func = Conn::_send_data_dtls_handshake;
+                        conn->recv_data_func = Conn::_recv_data_dtls_handshake;
+                        conn->ev_socket.add(FdEvent::READ | FdEvent::WRITE);
                     }
                     else
                     {
+                        /*determine if socket type is UDP*/
+                        int type;
+                        socklen_t  length = sizeof( socklen_t  );
+                        getsockopt( client_fd, SOL_SOCKET, SO_TYPE, &type, &length );
+
                         conn->send_data_func = Conn::_send_data;
                         conn->recv_data_func = Conn::_recv_data;
+                        //if UDP socket overwrite used functions
+                        if(type == SOCK_DGRAM){
+                            conn->send_data_func = Conn::_send_data_udp;
+                            conn->recv_data_func = Conn::_recv_data_udp;
+                        }
+
                         enable_send_buffer(conn, client_fd);
                         cpool->on_worker_setup(conn);
                         cpool->disp_tcall->async_call([cpool, conn](ThreadCall::Handle &) {
                             try {
                                 cpool->on_dispatcher_setup(conn);
+                                //SALTICIDAE_LOG_INFO("dispatcher_setup finished");
                                 cpool->update_conn(conn, true);
+                                //SALTICIDAE_LOG_INFO("update_conn in feed is finished");
                             } catch (...) {
+                                //SALTICIDAE_LOG_INFO("disp_terminate called in feed");
                                 cpool->recoverable_error(std::current_exception(), -1);
                                 cpool->disp_terminate(conn);
                             }
@@ -363,6 +420,8 @@ class ConnPool {
     salticidae::BoxObj<Worker[]> workers;
 
     void accept_client(int, int);
+    //add udp_accept client
+    void accept_client_udp(int, int);
     void conn_server(const conn_t &conn, int, int);
     conn_t add_conn(const conn_t &conn);
     void del_conn(const conn_t &conn);
@@ -393,7 +452,9 @@ class ConnPool {
         size_t _max_recv_buff_size;
         size_t _max_send_buff_size;
         size_t _nworker;
+        uint16_t _index;
         bool _enable_tls;
+        bool _enable_dtls;
         std::string _tls_cert_file;
         std::string _tls_key_file;
         RcObj<X509> _tls_cert;
@@ -409,7 +470,9 @@ class ConnPool {
             _max_recv_buff_size(4096),
             _max_send_buff_size(0),
             _nworker(1),
+            _index(0),
             _enable_tls(false),
+            _enable_dtls(false),
             _tls_cert_file(""),
             _tls_key_file(""),
             _tls_cert(nullptr),
@@ -447,8 +510,18 @@ class ConnPool {
             return *this;
         }
 
+        Config &index(uint16_t x) {
+            _index = x;
+            return *this;
+        }
+
         Config &enable_tls(bool x) {
             _enable_tls = x;
+            return *this;
+        }
+
+        Config &enable_dtls(bool x) {
+            _enable_dtls = x;
             return *this;
         }
 
@@ -485,7 +558,10 @@ class ConnPool {
 
     ConnPool(const EventContext &ec, const Config &config):
             system_state(0), ec(ec),
+            counter(0), // used for designating server/client roles for DTLS handshake
+            index(config._index),
             enable_tls(config._enable_tls),
+            enable_dtls(config._enable_dtls),
             async_id(0),
             max_listen_backlog(config._max_listen_backlog),
             conn_server_timeout(config._conn_server_timeout),
@@ -493,6 +569,7 @@ class ConnPool {
             max_recv_buff_size(config._max_recv_buff_size),
             max_send_buff_size(config._max_send_buff_size),
             tls_ctx(nullptr),
+            dtls_ctx(nullptr),
             listen_fd(-1),
             nworker(config._nworker) {
         if (enable_tls)
@@ -510,6 +587,22 @@ class ConnPool {
             tls_ctx->set_verify(config._tls_skip_ca_check, config._tls_verify_callback);
             if (!tls_ctx->check_privkey())
                 throw SalticidaeError(SALTI_ERROR_TLS_KEY_NOT_MATCH);
+        } // DTLS equivalent to TLS, initializes DTLS context
+        else if(enable_dtls)
+        {
+            dtls_ctx = new DTLSContext();
+            if (config._tls_cert)
+                tls_cert = config._tls_cert;
+            else
+                tls_cert = new X509(X509::create_from_pem_file(config._tls_cert_file));
+            dtls_ctx->use_cert(*tls_cert);
+            if (config._tls_key)
+                dtls_ctx->use_privkey(*config._tls_key);
+            else
+                dtls_ctx->use_privkey_file(config._tls_key_file);
+            dtls_ctx->set_verify(config._tls_skip_ca_check, config._tls_verify_callback);
+            if (!dtls_ctx->check_privkey())
+                throw SalticidaeError(SALTI_ERROR_TLS_KEY_NOT_MATCH);
         }
         signal(SIGPIPE, SIG_IGN);
         workers = new Worker[nworker];
@@ -518,6 +611,7 @@ class ConnPool {
         disp_tcall = workers[0].get_tcall();
         workers[0].set_dispatcher();
         disp_error_cb = [this](const std::exception_ptr err) {
+            //SALTICIDAE_LOG_INFO("disp_error_cb was called");
             workers[0].stop_tcall();
             user_tcall->async_call([this, err](ThreadCall::Handle &) {
                 for (size_t i = 1; i < nworker; i++)
@@ -631,6 +725,7 @@ class ConnPool {
     void terminate(const conn_t &conn) {
         disp_tcall->async_call([this, conn](ThreadCall::Handle &) {
             try {
+                SALTICIDAE_LOG_INFO("disp_terminate called in terminate");
                 disp_terminate(conn);
             } catch (...) {
                 disp_error_cb(std::current_exception());

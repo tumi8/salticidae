@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <netinet/in.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -59,7 +60,7 @@ ConnPool::Conn::operator std::string() const {
 }
 
 /* the following functions are executed by exactly one worker per Conn object */
-
+// here are the actual fd send calls
 void ConnPool::Conn::_send_data(const conn_t &conn, int fd, int events) {
     if (events & FdEvent::ERROR)
     {
@@ -85,6 +86,55 @@ void ConnPool::Conn::_send_data(const conn_t &conn, int fd, int events) {
                 {
                     SALTICIDAE_LOG_INFO("send(%d) failure: %s", fd, strerror(errno));
                     conn->cpool->worker_terminate(conn);
+                    return;
+                }
+            }
+            else
+                /* rewind the leftover */
+                conn->send_buffer.rewind(
+                    bytearray_t(buff_seg.begin() + ret, buff_seg.end()));
+            /* wait for the next write callback */
+            conn->ready_send = false;
+            return;
+        }
+    }
+    /* the send_buffer is empty though the kernel buffer is still available, so
+     * temporarily mask the WRITE event and mark the `ready_send` flag */
+    conn->ev_socket.del();
+    conn->ev_socket.add(conn->ready_recv ? 0 : FdEvent::READ);
+    conn->ready_send = true;
+}
+
+//replicated function _send_data for UDP usage, just removed connection breakdown
+void ConnPool::Conn::_send_data_udp(const conn_t &conn, int fd, int events) {
+    if (events & FdEvent::ERROR)
+    {
+        SALTICIDAE_LOG_INFO("error in _send_data");
+        conn->cpool->worker_terminate(conn);
+        return;
+    }
+    ssize_t ret = conn->recv_chunk_size;
+    for (;;)
+    {
+        bytearray_t buff_seg = conn->send_buffer.move_pop();
+        ssize_t size = buff_seg.size();
+        if (!size) break;
+        //SALTICIDAE_LOG_INFO("size of bytes to send is %d", size);
+        ret = send(fd, buff_seg.data(), size, 0);
+        SALTICIDAE_LOG_DEBUG("socket(%d) sent %zd bytes", fd, ret);
+        //SALTICIDAE_LOG_INFO("socket(%d) sent %zd bytes", fd, ret);
+        size -= ret;
+        if (size > 0)
+        {
+            if (ret < 1) /* nothing is sent */
+            {
+                /* rewind the whole buff_seg */
+                conn->send_buffer.rewind(std::move(buff_seg));
+                if (ret < 0 && errno != EWOULDBLOCK)
+                {
+                    SALTICIDAE_LOG_INFO("send(%d) failure: %s", fd, strerror(errno));
+                    //dont break down when send connection refused
+                    //conn->cpool->worker_terminate(conn);
                     return;
                 }
             }
@@ -148,6 +198,54 @@ void ConnPool::Conn::_recv_data(const conn_t &conn, int fd, int events) {
     conn->cpool->on_read(conn);
 }
 
+//replicated function _recv_data for UDP usage, removed connection breakdown
+void ConnPool::Conn::_recv_data_udp(const conn_t &conn, int fd, int events) {
+    if (events & FdEvent::ERROR)
+    {
+        SALTICIDAE_LOG_INFO("error in _recv_data");
+        conn->cpool->worker_terminate(conn);
+        return;
+    }
+    const size_t recv_chunk_size = conn->recv_chunk_size;
+    ssize_t ret = recv_chunk_size;
+    while (ret == (ssize_t)recv_chunk_size)
+    {
+        if (conn->recv_buffer.len() >= conn->max_recv_buff_size)
+        {
+            /* recv_buffer is full, temporarily mask the READ event */
+            conn->ev_socket.del();
+            conn->ev_socket.add(conn->ready_send ? 0 : FdEvent::WRITE);
+            conn->ready_recv = true;
+            return;
+        }
+        bytearray_t buff_seg;
+        buff_seg.resize(recv_chunk_size);
+        ret = recv(fd, buff_seg.data(), recv_chunk_size, 0);
+        SALTICIDAE_LOG_DEBUG("socket(%d) read %zd bytes", fd, ret);
+        //SALTICIDAE_LOG_INFO("socket(%d) read %zd bytes", fd, ret);
+        //if nonblocking and no message is available then -1 is returned
+        if (ret < 0)
+        {
+            if (errno == EWOULDBLOCK) break;
+            SALTICIDAE_LOG_INFO("recv(%d) failure: %s", fd, strerror(errno));
+            /* connection err or half-opened connection */
+            //conn->cpool->worker_terminate(conn);
+            return;
+        }
+        if (ret == 0)
+        {
+            /* the remote closes the connection or zero-length datagrams */
+            //conn->cpool->worker_terminate(conn);
+            return;
+        }
+        buff_seg.resize(ret);
+        conn->recv_buffer.push(std::move(buff_seg));
+    }
+    /* wait for the next read callback */
+    conn->ready_recv = false;
+    conn->cpool->on_read(conn);
+}
+
 
 void ConnPool::Conn::_send_data_tls(const conn_t &conn, int fd, int events) {
     if (events & FdEvent::ERROR)
@@ -191,6 +289,52 @@ void ConnPool::Conn::_send_data_tls(const conn_t &conn, int fd, int events) {
     conn->ev_socket.add(conn->ready_recv ? 0 : FdEvent::READ);
     conn->ready_send = true;
 }
+//replicated function _send_data_tls for DTLS usage, removed connection breakdown and custom DTLS record split, replaced tls context by dtls
+void ConnPool::Conn::_send_data_dtls(const conn_t &conn, int fd, int events) {
+    //SALTICIDAE_LOG_INFO("_send_data_dtls was called"); //_send_data_udp
+    if (events & FdEvent::ERROR)
+    {
+        //conn->cpool->worker_terminate(conn);
+        return;
+    }
+    ssize_t ret = conn->recv_chunk_size;
+    auto &dtls = conn->dtls;
+    for (;;)
+    {
+        bytearray_t buff_seg = conn->send_buffer.move_pop();
+        ssize_t size = buff_seg.size();
+        if (!size) break;
+        //next line newly added for DTLS messages large 2^14 bytes
+        ssize_t sendbytes = std::min( (int) size, SSL3_RT_MAX_PLAIN_LENGTH);
+        ret = dtls->send(buff_seg.data(), sendbytes);
+        SALTICIDAE_LOG_DEBUG("ssl(%d) sent %zd bytes", fd, ret);
+        size -= ret;
+        if (size > 0)
+        {
+            if (ret < 1) /* nothing is sent */
+            {
+                /* rewind the whole buff_seg */
+                conn->send_buffer.rewind(std::move(buff_seg));
+                if (ret < 0 && dtls->get_error(ret) != SSL_ERROR_WANT_WRITE)
+                {
+                    //SALTICIDAE_LOG_INFO("send(%d) failure: %s", fd, strerror(errno));
+                    //conn->cpool->worker_terminate(conn); dont die if others are not reachable
+                    return;
+                }
+            }
+            else
+                /* rewind the leftover */
+                conn->send_buffer.rewind(
+                    bytearray_t(buff_seg.begin() + ret, buff_seg.end()));
+            /* wait for the next write callback */
+            conn->ready_send = false;
+            return;
+        }
+    }
+    conn->ev_socket.del();
+    conn->ev_socket.add(conn->ready_recv ? 0 : FdEvent::READ);
+    conn->ready_send = true;
+}
 
 void ConnPool::Conn::_recv_data_tls(const conn_t &conn, int fd, int events) {
     if (events & FdEvent::ERROR)
@@ -217,7 +361,7 @@ void ConnPool::Conn::_recv_data_tls(const conn_t &conn, int fd, int events) {
         if (ret < 0)
         {
             if (tls->get_error(ret) == SSL_ERROR_WANT_READ) break;
-            SALTICIDAE_LOG_INFO("recv(%d) failure: %s", fd, strerror(errno));
+            //SALTICIDAE_LOG_INFO("recv(%d) failure: %s", fd, strerror(errno));
             conn->cpool->worker_terminate(conn);
             return;
         }
@@ -232,10 +376,58 @@ void ConnPool::Conn::_recv_data_tls(const conn_t &conn, int fd, int events) {
     conn->ready_recv = false;
     conn->cpool->on_read(conn);
 }
+//replicated function _recv_data_dtls for DTLS usage, removed connection breakdown, replaced tls context by dtls
+void ConnPool::Conn::_recv_data_dtls(const conn_t &conn, int fd, int events) {
+    //SALTICIDAE_LOG_INFO("_recv_data_dtls was called");
+    if (events & FdEvent::ERROR)
+    {
+        //conn->cpool->worker_terminate(conn);
+        return;
+    }
+    const size_t recv_chunk_size = conn->recv_chunk_size;
+    ssize_t ret = recv_chunk_size;
+    auto &dtls = conn->dtls;
+    while (ret == (ssize_t)recv_chunk_size)
+    {
+        if (conn->recv_buffer.len() >= conn->max_recv_buff_size)
+        {
+            conn->ev_socket.del();
+            conn->ev_socket.add(conn->ready_send ? 0 : FdEvent::WRITE);
+            conn->ready_recv = true;
+            return;
+        }
+        bytearray_t buff_seg;
+        buff_seg.resize(recv_chunk_size);
+        ret = dtls->recv(buff_seg.data(), recv_chunk_size);
+        SALTICIDAE_LOG_DEBUG("ssl(%d) read %zd bytes", fd, ret);
+        if (ret < 0)
+        {
+            if (dtls->get_error(ret) == SSL_ERROR_WANT_READ) break;
+            SALTICIDAE_LOG_INFO("recv(%d) failure: %s", fd, strerror(errno));
+            //conn->cpool->worker_terminate(conn);
+            return;
+        }
+        if (ret == 0)
+        {
+            //conn->cpool->worker_terminate(conn);
+            return;
+        }
+        buff_seg.resize(ret);
+        conn->recv_buffer.push(std::move(buff_seg));
+    }
+    conn->ready_recv = false;
+    conn->cpool->on_read(conn);
+}
 
 void ConnPool::Conn::_send_data_tls_handshake(const conn_t &conn, int fd, int events) {
     conn->ready_send = true;
     _recv_data_tls_handshake(conn, fd, events);
+}
+
+// replicated _send_data_tls_handshake for DTLS, just a wrapper function
+void ConnPool::Conn::_send_data_dtls_handshake(const conn_t &conn, int fd, int events) {
+    conn->ready_send = true;
+    _recv_data_dtls_handshake(conn, fd, events);
 }
 
 void ConnPool::Conn::_recv_data_tls_handshake(const conn_t &conn, int, int) {
@@ -270,9 +462,58 @@ void ConnPool::Conn::_recv_data_tls_handshake(const conn_t &conn, int, int) {
     }
 }
 
+// replicated _recv_data_tls_handshake for DTLS, major changes using SSL_accept and SSL_connect
+void ConnPool::Conn::_recv_data_dtls_handshake(const conn_t &conn, int, int) {
+    int ret;
+    if (conn->dtls->do_handshake(ret))
+    {
+        SALTICIDAE_LOG_INFO("Handshake successful!");
+        /* finishing DTLS handshake */
+        conn->send_data_func = _send_data_dtls;
+        /* do not start receiving data immediately */
+        conn->recv_data_func = _recv_data_dummy;
+        conn->ev_socket.del();
+        //conn->ev_socket.add(FdEvent::WRITE);
+        conn->peer_cert = new X509(conn->dtls->get_peer_cert());
+        conn->worker->enable_send_buffer(conn, conn->fd);
+        auto cpool = conn->cpool;
+        cpool->on_worker_setup(conn);
+        cpool->disp_tcall->async_call([cpool, conn](ThreadCall::Handle &) {
+            try {
+                //SALTICIDAE_LOG_INFO("on_dispatcher_setup called!");
+                cpool->on_dispatcher_setup(conn);
+                //SALTICIDAE_LOG_INFO("update_conn called!");
+                cpool->update_conn(conn, true);
+            } catch (...) {
+                //SALTICIDAE_LOG_INFO("disp_terminate called in _recv_data_dtls_handshake");
+                cpool->recoverable_error(std::current_exception(), -1);
+                cpool->disp_terminate(conn);
+            }
+        });
+    }
+    else
+    {
+        conn->ev_socket.del();
+
+        if(SSL_is_server(conn->dtls->ssl))
+        {
+            SSL_accept(conn->dtls->ssl);
+        }
+        else
+        {
+            SSL_connect(conn->dtls->ssl);
+        }
+        //conn->ev_socket.add(ret == 0 ? FdEvent::READ : FdEvent::WRITE);
+        conn->ev_socket.add(FdEvent::READ | FdEvent::WRITE);
+        //SALTICIDAE_LOG_DEBUG("dtls handshake %s", ret == 0 ? "read" : "write");
+        //SALTICIDAE_LOG_INFO("dtls handshake %s", ret == 0 ? "read" : "write");
+    }
+}
+
 void ConnPool::Conn::_recv_data_dummy(const conn_t &, int, int) {}
 
 void ConnPool::worker_terminate(const conn_t &conn) {
+    //SALTICIDAE_LOG_INFO("worker_terminate was called, starting asynch teardown");
     conn->worker->get_tcall()->async_call([this, conn](ThreadCall::Handle &) {
         if (!conn->set_terminated()) return;
         on_worker_teardown(conn);
@@ -286,6 +527,7 @@ void ConnPool::worker_terminate(const conn_t &conn) {
 /****/
 
 void ConnPool::disp_terminate(const conn_t &conn) {
+    //SALTICIDAE_LOG_INFO("disp_terminate was called");
     auto worker = conn->worker;
     if (worker)
         worker_terminate(conn);
@@ -296,6 +538,44 @@ void ConnPool::disp_terminate(const conn_t &conn) {
             //conn->stop();
             del_conn(conn);
         });
+}
+
+//replicated accept_client for UDP, but not used anymore
+void ConnPool::accept_client_udp(int fd, int) {
+    int client_fd;
+    struct sockaddr client_addr;
+    try {
+        socklen_t addr_size = sizeof(struct sockaddr_in);
+        if ((client_fd = accept(fd, &client_addr, &addr_size)) < 0)
+        {
+            ev_listen.del();
+            throw ConnPoolError(SALTI_ERROR_ACCEPT, errno);
+        }
+        else
+        {
+            int one = 1;
+            if (setsockopt(client_fd, SOL_TCP, TCP_NODELAY, (const char *)&one, sizeof(one)) < 0)
+                throw ConnPoolError(SALTI_ERROR_ACCEPT, errno);
+            if (fcntl(client_fd, F_SETFL, O_NONBLOCK) == -1)
+                throw ConnPoolError(SALTI_ERROR_ACCEPT, errno);
+
+            NetAddr addr((struct sockaddr_in *)&client_addr);
+            conn_t conn = create_conn();
+            conn->send_buffer.set_capacity(max_send_buff_size);
+            conn->recv_chunk_size = recv_chunk_size;
+            conn->max_recv_buff_size = max_recv_buff_size;
+            conn->fd = client_fd;
+            conn->cpool = this;
+            conn->mode = Conn::PASSIVE;
+            conn->addr = addr;
+            add_conn(conn);
+            SALTICIDAE_LOG_INFO("accepted %s", std::string(*conn).c_str());
+            //SALTICIDAE_LOG_INFO("THIS FUNCTION accept_client_udp shouldnt be called ", std::string(*conn).c_str());
+            auto &worker = select_worker();
+            conn->worker = &worker;
+            worker.feed(conn, client_fd);
+        }
+    } catch (...) { recoverable_error(std::current_exception(), -1); }
 }
 
 void ConnPool::accept_client(int fd, int) {
@@ -351,9 +631,28 @@ void ConnPool::conn_server(const conn_t &conn, int fd, int events) {
             throw SalticidaeError(SALTI_ERROR_CONNECT, errno);
         }
     } catch (...) {
+        //SALTICIDAE_LOG_INFO("disp_terminate called in conn_server");
         disp_terminate(conn);
         recoverable_error(std::current_exception(), -1);
     }
+}
+//replicated _listen for UDP, but not used anymore
+void ConnPool::_listen_udp(NetAddr listen_addr) {
+    int one = 1;
+    if ((listen_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
+        throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
+
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+
+    struct sockaddr_in sockin;
+    memset(&sockin, 0, sizeof(struct sockaddr_in));
+    sockin.sin_family = AF_INET;
+    sockin.sin_addr.s_addr = INADDR_ANY;
+    sockin.sin_port = listen_addr.port;
+
+    if (bind(listen_fd, (struct sockaddr *)&sockin, sizeof(sockin)) < 0)
+        throw ConnPoolError(SALTI_ERROR_LISTEN, errno);
+    accept_client_udp(0,0);
 }
 
 void ConnPool::_listen(NetAddr listen_addr) {
@@ -387,6 +686,78 @@ void ConnPool::_listen(NetAddr listen_addr) {
     SALTICIDAE_LOG_INFO("listening to %u", ntohs(listen_addr.port));
 }
 
+// replicated_connect for UDP and DTLS, major changes: here the socket is switched from TCP to UDP
+ConnPool::conn_t ConnPool::_connect_udp(const NetAddr &addr,const NetAddr &listen_addr) {
+    //SALTICIDAE_LOG_INFO("creating UDP socket connection in _connect_udp");
+    int fd;
+    int one = 1;
+    if ((fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
+        throw ConnPoolError(SALTI_ERROR_CONNECT, errno);
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
+        throw ConnPoolError(SALTI_ERROR_CONNECT, errno);
+    conn_t conn = create_conn();
+    conn->send_buffer.set_capacity(max_send_buff_size);
+    conn->recv_chunk_size = recv_chunk_size;
+    conn->max_recv_buff_size = max_recv_buff_size;
+    conn->fd = fd;
+    conn->cpool = this;
+
+    if((index+counter) % 2 == 0)
+    {
+        conn->mode = Conn::ACTIVE; // here decide connection mode (for DTLS handshake) based on replica index and number of already established connections
+    }
+    else
+    {
+        conn->mode = Conn::PASSIVE;
+    }
+    counter++;
+    conn->addr = addr;
+    add_conn(conn);
+
+    //own internet socket address including preconfigured listening port
+    struct sockaddr_in sock_own;
+    memset(&sock_own, 0, sizeof(struct sockaddr_in));
+    sock_own.sin_family = AF_INET;
+    sock_own.sin_addr.s_addr = INADDR_ANY;
+    sock_own.sin_port = listen_addr.port;
+    //SALTICIDAE_LOG_INFO("listen_addr port is: %d",ntohs(listen_addr.port));
+
+    //target internet socket address
+    struct sockaddr_in sockin;
+    memset(&sockin, 0, sizeof(struct sockaddr_in));
+    sockin.sin_family = AF_INET;
+    sockin.sin_addr.s_addr = addr.ip;
+    sockin.sin_port = addr.port;
+
+    //bind own internet socket address to file descriptor
+    if ( bind(fd, (struct sockaddr *)&sock_own, sizeof(struct sockaddr_in)) < 0 )
+    {
+        SALTICIDAE_LOG_INFO("[UDP bind failed] cannot bind to %s", std::string(addr).c_str());
+        disp_terminate(conn);
+
+    }
+
+    //connect UDP socket to encapsulate send and recv functions for UDP (so I don't have to use the sendto and recvfrom functions --> less code to change)
+    if (::connect(fd, (struct sockaddr *)&sockin,
+                sizeof(struct sockaddr_in)) < 0 && errno != EINPROGRESS)
+    {
+        SALTICIDAE_LOG_INFO("[UDP] cannot connect to %s", std::string(addr).c_str());
+        disp_terminate(conn);
+    }
+    else
+    {
+        conn->ev_connect = TimedFdEvent(disp_ec, conn->fd, [this, conn](int fd, int events) {
+            conn_server(conn, fd, events); // this calls feed
+            //for repeated attempts add conn->ev_connect.add( 0, 2); again if conn_server didn't work
+        });
+        conn->ev_connect.add( 0, 2); //wait 2 secs before starting conn_server to ensure the socket of the receiver has been created already; otherwise an ICMP error is thrown
+
+        SALTICIDAE_LOG_INFO("created UDP socket connection %s", std::string(*conn).c_str());
+    }
+    return conn;
+}
 ConnPool::conn_t ConnPool::_connect(const NetAddr &addr) {
     int fd;
     int one = 1;
@@ -438,6 +809,7 @@ void ConnPool::del_conn(const conn_t &conn) {
     release_conn(conn);
 }
 
+// lost connection message comes from here
 void ConnPool::release_conn(const conn_t &conn) {
     /* inform the upper layer the connection will be destroyed */
     conn->ev_connect.clear();
