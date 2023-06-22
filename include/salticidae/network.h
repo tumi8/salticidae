@@ -168,7 +168,7 @@ class MsgNetwork: public ConnPool {
         Config(): Config(ConnPool::Config()) {}
         Config(const ConnPool::Config &config):
             ConnPool::Config(config),
-            _max_msg_size(1024),
+            _max_msg_size(65536),
             _max_msg_queue_size(65536),
             _burst_size(1000),
             _msg_magic(0x0) {}
@@ -982,8 +982,7 @@ void PeerNetwork<O, _, __>::ping_handler(MsgPing &&msg, const conn_t &conn) {
                         return;
                     }
                     auto &p = pit->second;
-                    if (p->state != Peer::State::DISCONNECTED ||
-                        (!p->addr.is_null() && p->addr != msg.claimed_addr)) return;
+                    if (p->state != Peer::State::DISCONNECTED) return;
                     SALTICIDAE_LOG_DEBUG("%s%s%s: inbound handshake from %s%s%s",
                         tty_secondary_color, id_hex.c_str(), tty_reset_color,
                         tty_secondary_color, p->id_hex.c_str(), tty_reset_color);
@@ -1053,8 +1052,7 @@ void PeerNetwork<O, _, __>::pong_handler(MsgPong &&msg, const conn_t &conn) {
                     }
                     auto &p = pit->second;
                     assert(!p->addr.is_null() && p->addr == conn->get_addr());
-                    if (p->state != Peer::State::DISCONNECTED ||
-                        p->addr != msg.claimed_addr) return;
+                    if (p->state != Peer::State::DISCONNECTED) return;
                     SALTICIDAE_LOG_DEBUG("%s%s%s: outbound handshake to %s%s%s",
                         tty_secondary_color, id_hex.c_str(), tty_reset_color,
                         tty_secondary_color, p->id_hex.c_str(), tty_reset_color);

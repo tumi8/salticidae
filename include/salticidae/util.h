@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "salticidae/config.h"
+#include <stdexcept>
 
 typedef struct SalticidaeCError {
     int code;
